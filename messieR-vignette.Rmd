@@ -1,0 +1,221 @@
+---
+title: "Getting started with messieR"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Getting started with messieR}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", fig.width = 6,
+                      fig.height = 4)
+set.seed(20260815)
+
+#currently written as source("../messieR_core.R").
+#once split out, library(messieR)
+if (!exists("sim_var1")) source("../messieR_core.R")
+```
+
+## What this is for?
+
+Simulation-based power analysis for a person-specific VAR(1) inherits whatever
+you assume about the data-generating process, such as Gaussian innovations,
+total data completeness, and one set of parameters for everyone. Since these
+aren't representative of what experience sampling researchers may generally
+observe in the real world, you get a sample-size recommendation that is not 
+representative. What `messieR` lets you do is vary those assumptions one at a 
+time and measure what, each could be worth in your scenario.
+
+Note that this vignette runs entirely on simulated data, so it can build without 
+a network connection. The last section shows the path to real archives, which 
+does need you to be connected.
+
+## The shortest useful example
+
+Specify a transition matrix, generate a series, fit it, and get intervals from
+all three procedures.
+
+```{r basic}
+phi <- matrix(c(0.5, 0.1,
+                0.1, 0.5), 2, byrow = TRUE)
+
+is_stationary(phi)                      #check if eigenvalues inside the circle?
+
+Y   <- sim_var1(100, phi, sigma = diag(2))
+fit <- fit_var1(Y)
+round(fit$phi_hat, 3)
+```
+
+```{r basic-boot}
+res <- boot_var1_all(Y, B = 199)
+res[res$coef == "phi12", c("procedure", "est", "ci_lo", "ci_hi", "pval")]
+```
+
+Every row carries the same `est`, because the three procedures share one point
+estimate and differ only in how they quantify uncertainty. When you display
+display all of `res`, you can see that the `se` column is populated only for the 
+Wald row. On the other hand, the bootstrap rows capture uncertainty through 
+bias-corrected estimates (which is `NA` for Wald).
+
+## A couple of conventions worth knowing before you trust output
+
+### Transitions and VAR(1)
+
+A VAR(1) is estimated from transitions, so `fit_var1()` lags the series first 
+and drops incomplete pairs second. A pair thus enters the regression only when 
+both endpoints are observed **and adjacent in time**. Noting how this order 
+matters, deleting rows before lagging is going to splice non-adjacent 
+observations into transitions that never happened. This means those false pairs 
+carry weaker dependence than real ones, which pulls coefficients toward zero.
+
+We can observe this with missingness:
+
+```{r transitions}
+Ym <- inject_mcar(Y, rate = 0.30)             #30% of variable 2 removed
+
+rows_complete <- mean(stats::complete.cases(Ym))
+pairs_ok <- {
+  a <- Ym[-1, , drop = FALSE]; b <- Ym[-nrow(Ym), , drop = FALSE]
+  mean(stats::complete.cases(a) & stats::complete.cases(b))
+}
+c(rows = round(rows_complete, 3),
+  transitions = round(pairs_ok, 3),
+  predicted = round(rows_complete^2, 3))
+```
+
+Seventy percent of rows leaves roughly half the transitions. A thirty percent
+compliance gap costs about half your usable data, so if you're able to increase
+compliance, more power to you.
+
+### Coded gaps only
+
+Deletion can exclude a gap only if the gap is recorded. Some public archives
+store unanswered prompts as **absent rows** rather than `NA` rows; in such a 
+case, the transition-level logic above cannot see anything to exclude. It's best 
+to check this before fitting:
+
+```{r gapcheck, eval = FALSE}
+# if counter is the running prompt index for one participant...
+#your_data <- ...
+if(exists("your_data"))
+  range(diff(sort(as.numeric(your_data$counter))))   
+```
+
+If that returns values over 1, reindex onto the prompt grid, inserting `NA`
+rows for absent prompts and one `NA` row at each day boundary, so that no 
+transition spans a night.
+
+
+## Varying the innovation distribution
+
+`sim_var1()` takes its innovations from one of three sources, in precedence: 
+an empirical `residual_pool` beats a supplied `innov_fn`, which beats a Gaussian `sigma`.
+
+```{r innov}
+heavy <- function(n) matrix(rt(2 * n, df = 4), n, 2) / sqrt(4 / 2)
+
+Y_gauss <- sim_var1(100, phi, sigma = diag(2))
+Y_heavy <- sim_var1(100, phi, innov_fn = heavy)
+
+rbind(gaussian = round(fit_var1(Y_gauss)$phi_hat[1, ], 3),
+      heavy    = round(fit_var1(Y_heavy)$phi_hat[1, ], 3))
+```
+
+Consider how this substitution (say, skewed and heavy-tailed innovations) might
+impact bias, coverage, and power, and whether this impact is outside Monte Carlo 
+error of their Gaussian values. Consequently, it could be worth thinking on how
+much effort to spend on getting the exact shape of an ESM variable's distribution,
+versus compliance or assessing heterogeneity.
+
+## Empirical innovations
+
+A prospective use case of the `residual_pool` argument is to take a participant 
+that you already have, keep their dynamics and their residual structure, and 
+simulate the study you're about to run.
+
+```{r pool}
+mydat <- fit_var1(sim_var1(150, phi, innov_fn = heavy))   # stands in for real data
+
+Y_new <- sim_var1(80, mydat$phi_hat,
+                  delta = mydat$intercept,
+                  residual_pool = mydat$residuals,
+                  resample = "block")                     # keeps short-range structure
+dim(Y_new)
+```
+
+Note that `resample = "block"` draws contiguous runs of residuals rather than
+independent draws, with block length defaulting to
+`default_block_length()`, the rule $\lceil 5.03\,T^{1/4}\rceil$.
+
+## A small power analysis
+
+Everything above composes into the question you actually care about: "how many
+occasions do I need, given the compliance I expect?" So here's a demo that should
+take a couple of minutes:
+
+```{r power, cache = FALSE}
+power_at <- function(T_use, rate, n_sim = 60L, B = 99L) {
+  hits <- vapply(seq_len(n_sim), function(i) {
+    Y  <- sim_var1(T_use, phi, sigma = diag(2))
+    Yo <- if (rate > 0) inject_mcar(Y, rate) else Y
+    r  <- tryCatch(boot_var1_all(Yo, B = B), error = function(e) NULL)
+    if (is.null(r)) return(NA_integer_)
+    r$reject_05[r$procedure == "residual_iid" & r$coef == "phi12"]
+  }, integer(1))
+  c(power = mean(hits, na.rm = TRUE),
+    mcse  = mcse_proportion(hits))
+}
+
+round(rbind(`T=100, complete` = power_at(100, 0.00),
+            `T=100, 30% MCAR` = power_at(100, 0.30),
+            `T=150, 30% MCAR` = power_at(150, 0.30)), 3)
+```
+
+The settings here are small so that the vignette builds quickly, so
+read the pattern rather than the digits. Report the Monte Carlo standard error 
+alongside any number you take from a run like this. In fact at much smaller 
+counts it is warranted, as the random noise might make, say, an MCAR case's power 
+look slightly higher than the complete case purely by chance.
+
+## Where this cannot help
+
+While the bootstrap improves how the information you collected is used, it does
+not add information. Missingness driven by the unrecorded state itself (i.e., 
+"what if there's a reason or pattern to the holes in the data?") is a different 
+problem, and nothing here addresses it.
+
+The stationary bootstrap is included as an evaluated comparator. Resampling the 
+observed series in blocks manufactures a transition at every block junction, and 
+in the thesis it under-covered at all series lengths studied and over-declared 
+effects on real data. `residual_iid` is preferable, unless you have a specific 
+reason not to trust the VAR structure, in which case it could be worth comparing
+to the residual-block variant of Brüggemann, Jentsch and Trenkler.
+
+## Real archives
+
+Datasets from the openESM database can be pulled directly. This chunk is not
+evaluated, since building a vignette should not depend on a network.
+
+```{r openesm, eval = FALSE}
+library(openesm)
+
+cat <- list_datasets()                     # metadata only
+head(cat[, c("dataset_id", "first_author", "n_participants", "n_time_points")])
+
+ds  <- get_dataset("0011")
+dat <- as.data.frame(ds$data)
+
+# inspect first: participant id, prompt index, and two continuous variables
+str(dat)
+
+# then, per participant, with ID_COL / VAR1 / VAR2 set from that inspection
+Yp  <- cbind(as.numeric(dat[[VAR1]]), as.numeric(dat[[VAR2]]))[dat[[ID_COL]] == pid, ]
+boot_var1_all(Yp, B = 999)
+```
+
+## Session
+
+```{r session}
+sessionInfo()
+```
